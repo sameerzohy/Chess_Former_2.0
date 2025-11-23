@@ -1,0 +1,22 @@
+
+
+# Managing Chess PGN files using the chess package.
+# Chess-Package:
+# Core packages
+python-chess==1.999
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# Deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Training utilities
+einops>=0.7.0
+torchmetrics>=1.2.0
+
+# Optional but recommended
+matplotlib>=3.7.0
+wandb>=0.16.0
