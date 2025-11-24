@@ -90,8 +90,8 @@ class PGN_Moves(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        # Convert everything to tensors
-        x = sample["x"].clone().detach().float()      # (64,112)
+        # x is already a float32 tensor of shape (64, 112)
+        x = sample["x"]
         from_sq = torch.tensor(sample["from_sq"], dtype=torch.long)
         to_sq = torch.tensor(sample["to_sq"], dtype=torch.long)
         promo = torch.tensor(sample["promo"], dtype=torch.long)
@@ -125,7 +125,7 @@ class PGN_Moves(Dataset):
         # Should not reach here with filtered results
         return 1
 
-        
+
 PIECE_TO_IDX = {
     'P': 0, 
     'N': 1,
@@ -141,79 +141,114 @@ PIECE_TO_IDX = {
     'k': 11
 }
 
-def board_to_piece(board: chess.Board):
-    fen = board.board_fen()
-    rows = fen.split("/")
-    grid = []
-    for row in rows: 
-        grid_row = []
-        for ch in row:
-            if ch.isdigit():
-                for _ in range(int(ch)):
-                    grid_row.append(-1)
-            else:
-                grid_row.append(PIECE_TO_IDX[ch])
-        assert len(grid_row) == 8
-        grid.append(grid_row)
-        
-    assert len(grid) == 8 
-    return torch.tensor(grid, dtype=torch.long)
+def board_to_piece_fast(board: chess.Board):
+    """
+    Returns an (8, 8) grid of piece indices, -1 = empty.
+    Row 0 corresponds to rank 8 (a8..h8), row 7 to rank 1 (a1..h1),
+    matching the original board_to_piece orientation.
+    """
+    grid = torch.full((8, 8), -1, dtype=torch.long)
+
+    for sq, piece in board.piece_map().items():
+        rank = chess.square_rank(sq)   # 0..7, 0 = rank 1
+        file = chess.square_file(sq)   # 0..7, 0 = file a
+
+        # row 0 = rank 8, so flip the rank
+        row = 7 - rank
+        col = file
+
+        grid[row, col] = PIECE_TO_IDX[piece.symbol()]
+
+    return grid
 
 
 def build_piece_history(board_history):
+    """
+    Builds the (64, HISTORY_STEPS * NUM_PIECE_TYPES) one-hot piece history
+    in a vectorized way, preserving the original semantics:
+    - If history is shorter than H, it is left-padded with the first board.
+    - If longer than H, keep only the last H boards.
+    """
     H = HISTORY_STEPS
     if len(board_history) == 0:
         raise ValueError("board history must have atleast 1 board")
-    
+
+    # Ensure exactly H history steps, same as original logic
     if len(board_history) < H:
         first = board_history[0]
         board_history = [first] * (H - len(board_history)) + board_history
     else:
         board_history = board_history[-H:]
-        
-    piece_grids = [board_to_piece(board) for board in board_history]
-    feat = torch.zeros((64, PIECE_HIST_DIM), dtype=torch.float32)
-    
-    for t, grid in enumerate(piece_grids):
-        for rank in range(8):
-            for file in range(8):
-                s = rank * 8 + file 
-                piece_idx = grid[rank, file].item()
-                if piece_idx >= 0:
-                    offset = t * NUM_PIECE_TYPES + piece_idx 
-                    feat[s, offset] = 1.0
+
+    # piece_grids: (H, 8, 8), entries in {-1, 0..11}
+    piece_grids = torch.stack(
+        [board_to_piece_fast(board) for board in board_history],
+        dim=0
+    )  # (H, 8, 8)
+
+    # Flatten spatial dims: (H, 64)
+    flat = piece_grids.view(H, 64)  # (H, 64)
+
+    # Mask where there is a piece
+    mask = flat >= 0
+    if not mask.any():
+        # no pieces (shouldn't really happen), return all zeros
+        return torch.zeros((64, H * NUM_PIECE_TYPES), dtype=torch.float32)
+
+    # Indices of filled squares
+    pos = mask.nonzero(as_tuple=False)  # (K, 2): [t, square]
+    t_idx = pos[:, 0]                   # time indices
+    s_idx = pos[:, 1]                   # square indices
+    piece_idx = flat[mask]              # (K,)
+
+    # Build one-hot feature: (H, 64, 12)
+    feat = torch.zeros((H, 64, NUM_PIECE_TYPES), dtype=torch.float32)
+    feat[t_idx, s_idx, piece_idx] = 1.0
+
+    # Reshape to (64, H*12), with history blocks per square
+    feat = feat.permute(1, 0, 2).contiguous()  # (64, H, 12)
+    feat = feat.view(64, H * NUM_PIECE_TYPES)  # (64,  H*12)
+
     return feat 
 
 
 def build_metadata_features(board_history):
     current = board_history[-1]
     meta = torch.zeros(META_DIM, dtype=torch.float32)
+
+    # Side to move
     meta[0] = 1.0 if current.turn == chess.WHITE else 0.0 
     
+    # Castling rights
     castling_str = current.castling_xfen()
     meta[1] = 1.0 if 'K' in castling_str else 0.0 
     meta[2] = 1.0 if 'Q' in castling_str else 0.0 
     meta[3] = 1.0 if 'k' in castling_str else 0.0 
     meta[4] = 1.0 if 'q' in castling_str else 0.0
     
+    # En-passant possibility
     meta[5] = 0.0 if current.ep_square is None else 1.0 
+
+    # Halfmove clock / fullmove number (normalized)
     meta[6] = min(current.halfmove_clock / 100.0, 1.0)
     meta[7] = min(current.fullmove_number / 200.0, 1.0)
     
+    # Repetition-like features over last H plies
     H = min(len(board_history), HISTORY_STEPS)
     seen = set()
     for i in range(H):
-        b = board_history[-H+i]
+        b = board_history[-H + i]
         key = (b.board_fen(), b.turn, b.castling_xfen(), b.ep_square)
-        meta[8+i] = 1.0 if key in seen else 0.0
+        meta[8 + i] = 1.0 if key in seen else 0.0
         seen.add(key)
+
     return meta 
 
-def combine_features(board_history):
-    piece_history = build_piece_history(board_history)
-    meta = build_metadata_features(board_history)
-    
-    meta_broadcast = meta.unsqueeze(0).expand(64, -1)
-    raw_feats = torch.cat([piece_history, meta_broadcast], dim=1)
-    return raw_feats 
 
+def combine_features(board_history):
+    piece_history = build_piece_history(board_history)   # (64, PIECE_HIST_DIM)
+    meta = build_metadata_features(board_history)        # (META_DIM,)
+
+    meta_broadcast = meta.unsqueeze(0).expand(64, -1)    # (64, META_DIM)
+    raw_feats = torch.cat([piece_history, meta_broadcast], dim=1)  # (64, 112)
+    return raw_feats
