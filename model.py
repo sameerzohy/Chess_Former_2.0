@@ -23,13 +23,6 @@ class ChessFormer(nn.Module):
         self.feature_proj = nn.Linear(RAW_FEAT_DIM, d_model)
         self.square_embed = nn.Embedding(64, d_model)
 
-        # --- Use our relative encoder layer instead of nn.TransformerEncoderLayer ---
-        # encoder_layer = RelativeTransformerEncoderLayer(
-        #     d_model=d_model,
-        #     nhead=nhead,
-        #     dim_feedforward=dim_feedforward,
-        #     dropout=dropout,
-        # )
         self.encoder = nn.ModuleList([
             RelativeTransformerEncoderLayer(
                 d_model=d_model,

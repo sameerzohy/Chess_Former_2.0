@@ -1,4 +1,10 @@
 /venv/
 __pycache__/
 /__pycache__
-pgn-datasets
+pgn-datasets/
+.venv/
+checkpoints/
+pgn_chunks/
+checkpoint
+inference/__pycache__
+pgn-datasets/final_800K_elite.pgn
