@@ -1,6 +1,7 @@
 # chess_former.py
 
 import os
+import random
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -25,7 +26,8 @@ TRAIN_STATE_PATH = os.path.join(CHECKPOINT_DIR, "training_checkpoint.pt")
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-VALIDATE_EVERY_N_FILES = 50   # 🔥 run val + save model after each 50 train files
+VALIDATE_EVERY_N_FILES = 50    # run validation after every 50 train files
+VAL_FILES_PER_CHECK = 9        # 🔥 only use 9 validation files each time
 
 # -------------------
 #      DEVICE
@@ -78,21 +80,32 @@ print(f"Train files: {len(train_files)} | Val files: {len(val_files)}")
 #   VALIDATION HELPER
 # -------------------
 
-def run_validation(model, val_files, epoch, step_label=""):
+def run_validation(model, val_files, epoch, step_label="", max_val_files=VAL_FILES_PER_CHECK):
     """
-    Run full validation over all val_files and print summary.
+    Run validation on at most max_val_files from val_files.
+    Randomly samples a subset each time for faster feedback.
     Returns: (avg_val_loss, avg_val_policy_loss, avg_val_value_loss, val_policy_acc)
     """
     model.eval()
+
+    if max_val_files is not None and len(val_files) > max_val_files:
+        chosen_files = random.sample(val_files, max_val_files)
+    else:
+        chosen_files = val_files
+
+    print(
+        f"\n[VAL] Epoch {epoch + 1} {step_label} "
+        f"using {len(chosen_files)} / {len(val_files)} val files"
+    )
+
     total_val_loss = 0.0
     total_val_policy_loss = 0.0
     total_val_value_loss = 0.0
     total_val_samples = 0
     total_correct_moves = 0
 
-    print(f"\n[VAL] Epoch {epoch + 1} {step_label}")
-    for v_idx, v_pgn_path in enumerate(val_files, start=1):
-        print(f"  -> Validating on file {v_idx}/{len(val_files)}: {os.path.basename(v_pgn_path)}")
+    for v_idx, v_pgn_path in enumerate(chosen_files, start=1):
+        print(f"  -> Validating on file {v_idx}/{len(chosen_files)}: {os.path.basename(v_pgn_path)}")
 
         val_dataset = PGN_Moves(
             v_pgn_path,
@@ -109,7 +122,7 @@ def run_validation(model, val_files, epoch, step_label=""):
 
         val_bar = tqdm(
             val_loader,
-            desc=f"Epoch {epoch + 1} [val] file {v_idx}/{len(val_files)}",
+            desc=f"Epoch {epoch + 1} [val] file {v_idx}/{len(chosen_files)}",
         )
 
         with torch.no_grad():
@@ -246,7 +259,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # ---- VALIDATE + SAVE MODEL AFTER EACH 50 FILES OR AT THE END ----
         if (display_idx % VALIDATE_EVERY_N_FILES == 0) or (display_idx == len(train_files)):
             step_label = f"(after {display_idx} train files)"
-            avg_val_loss, _, _, _ = run_validation(model, val_files, epoch, step_label=step_label)
+            avg_val_loss, _, _, _ = run_validation(
+                model, val_files, epoch, step_label=step_label, max_val_files=VAL_FILES_PER_CHECK
+            )
 
             # 1) Save best model (based on val loss)
             if avg_val_loss < best_val_loss:
